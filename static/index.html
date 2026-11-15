@@ -1,0 +1,394 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0b0f1a">
+<title>Lyla</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { height: 100%; margin: 0; background: #0b0f1a; color: #e8ecf5;
+               font-family: system-ui, -apple-system, sans-serif; }
+  body { display: flex; flex-direction: column;
+         padding: env(safe-area-inset-top) 16px env(safe-area-inset-bottom); }
+  #topbar { display: flex; justify-content: flex-end; padding-top: 6px; }
+  #retrain { background: #1d2740; color: #b7c2df; border: 0; border-radius: 999px;
+             padding: 6px 12px; font-size: 12px; cursor: pointer; }
+  #log { flex: 1; overflow-y: auto; padding: 12px 0; display: flex;
+         flex-direction: column; gap: 10px; }
+  .me, .ly { padding: 8px 12px; border-radius: 14px; max-width: 85%; line-height: 1.35;
+             white-space: pre-wrap; }
+  .me { align-self: flex-end; background: #1d2740; }
+  .ly { align-self: flex-start; background: #2a1d40; }
+  #status { text-align: center; opacity: .85; font-size: 14px; padding: 4px; font-weight: 500; }
+  #timing { text-align: center; opacity: .4; font-size: 12px; min-height: 16px; }
+  #orb { width: 110px; height: 110px; border-radius: 50%; border: 0; margin: 12px auto 22px;
+         display: flex; align-items: center; justify-content: center; font-size: 14px;
+         color: #fff; cursor: pointer; text-align: center; padding: 10px;
+         background: radial-gradient(circle at 35% 30%, #3a4259, #1e2433);
+         user-select: none; transition: transform .12s, background .25s, box-shadow .25s; }
+  #orb.awake { background: radial-gradient(circle at 35% 30%, #8b7bff, #4a3fd6);
+               box-shadow: 0 0 24px rgba(139, 123, 255, 0.35); }
+  #orb.speaking { background: radial-gradient(circle at 35% 30%, #ff7ab8, #d63f8c);
+                  transform: scale(1.08); box-shadow: 0 0 28px rgba(255, 122, 184, 0.5); }
+  #orb.replying { background: radial-gradient(circle at 35% 30%, #4cd964, #28a745);
+                  box-shadow: 0 0 24px rgba(76, 217, 100, 0.35); }
+  #orb.muted { background: #2a151b; opacity: 0.6; }
+  .modal { position: fixed; inset: 0; background: #0b0f1a; display: flex; z-index: 10;
+           flex-direction: column; align-items: center; justify-content: center; gap: 16px;
+           padding: 24px; text-align: center; }
+  .btn { font-size: 17px; padding: 14px 28px; border-radius: 999px; border: 0;
+         background: #4a3fd6; color: #fff; cursor: pointer; }
+  .btn.rec { background: #d63f8c; }
+  .prompt-box { background: #161d2e; padding: 16px 20px; border-radius: 14px; max-width: 360px;
+                line-height: 1.5; font-size: 15px; color: #cfd8f0; }
+</style>
+</head>
+<body>
+<div id="overlay" class="modal">
+  <h2>Lyla</h2>
+  <button id="start" class="btn">Tap to start always-on mode</button>
+  <div id="err" style="opacity:.7;font-size:14px"></div>
+</div>
+
+<div id="enrollModal" class="modal" style="display:none">
+  <h2>Train Lyla on Your Voice</h2>
+  <div style="opacity:.8;font-size:14px;max-width:340px">
+    So Lyla only responds to <b>you</b> and never interrupts herself on speaker, tap below and read this out loud:
+  </div>
+  <div class="prompt-box">
+    "Hey Lyla, this is my voice. Whenever I speak to you on speaker mode, listen only to me and ignore your own echo."
+  </div>
+  <button id="enrollBtn" class="btn">Tap to Record (5s)</button>
+  <div id="enrollStatus" style="opacity:.75;font-size:14px"></div>
+</div>
+
+<div id="topbar">
+  <button id="retrain">Re-train Voice</button>
+</div>
+<div id="log"></div>
+<div id="status">Starting...</div>
+<div id="timing"></div>
+<button id="orb" title="Tap to mute/unmute mic">Sleeping</button>
+
+<script>
+const WORKLET = `
+class Cap extends AudioWorkletProcessor {
+  constructor() { super(); this.ratio = sampleRate / 16000; this.pos = 0; this.last = 0; this.acc = []; }
+  process(inputs) {
+    const x = inputs[0][0];
+    if (!x) return true;
+    const n = x.length, r = this.ratio;
+    let p = this.pos;
+    while (p < n - 1) {
+      const i = Math.floor(p), f = p - i;
+      const a = i < 0 ? this.last : x[i], b = x[i + 1];
+      this.acc.push(a + (b - a) * f);
+      p += r;
+    }
+    this.pos = p - n; this.last = x[n - 1];
+    if (this.acc.length >= 480) {
+      const pcm = new Int16Array(this.acc.length);
+      let sumSq = 0;
+      for (let k = 0; k < pcm.length; k++) {
+        const s = Math.max(-1, Math.min(1, this.acc[k]));
+        sumSq += s * s;
+        pcm[k] = s < 0 ? s * 32768 : s * 32767;
+      }
+      const rms = Math.sqrt(sumSq / pcm.length);
+      this.acc = [];
+      this.port.postMessage({ buffer: pcm.buffer, rms }, [pcm.buffer]);
+    }
+    return true;
+  }
+}
+registerProcessor('cap', Cap);`;
+
+const $ = id => document.getElementById(id);
+const logEl = $('log'), statusEl = $('status'), timingEl = $('timing'), orb = $('orb');
+
+const SPEECH_THRESHOLD = 0.016;
+const SPEECH_THRESHOLD_BARGE_IN = 0.011;
+const SILENCE_MS = 900;
+const PRE_ROLL_CHUNKS = 10;
+const ECHO_TAIL_MS = 300;
+
+let ws, ctx, currentTurn = null, nextTime = 0, sources = [], lyEl = null;
+let isAwake = false, isMuted = false, isSpeaking = false, isGenerating = false;
+let isEnrolling = false, enrollTimer = null;
+let silenceTimer = null, preRoll = [], ignoreUntil = 0;
+
+const setStatus = t => statusEl.textContent = t;
+const isLylaTalking = () => sources.length > 0 || isGenerating;
+
+async function requestWakeLock() {
+  try {
+    if ('wakeLock' in navigator) await navigator.wakeLock.request('screen');
+  } catch {}
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') {
+    if (ctx && ctx.state === 'suspended') ctx.resume().catch(() => {});
+    requestWakeLock();
+  }
+});
+
+function updateOrb() {
+  orb.className = '';
+  if (isMuted) {
+    orb.classList.add('muted');
+    orb.textContent = 'Mic Muted';
+  } else if (isSpeaking && !isLylaTalking()) {
+    orb.classList.add('speaking');
+    orb.textContent = 'Listening...';
+  } else if (isLylaTalking()) {
+    orb.classList.add('replying');
+    orb.textContent = 'Lyla Speaking';
+  } else if (isAwake) {
+    orb.classList.add('awake');
+    orb.textContent = 'Awake';
+  } else {
+    orb.textContent = 'Sleeping\n(Say "Lyla")';
+  }
+}
+
+function addMsg(cls, text) {
+  const d = document.createElement('div'); d.className = cls; d.textContent = text;
+  logEl.appendChild(d); logEl.scrollTop = logEl.scrollHeight; return d;
+}
+
+// ---------- Playback ----------
+function playChunk(int16) {
+  const buf = ctx.createBuffer(1, int16.length, 24000);
+  const ch = buf.getChannelData(0);
+  for (let i = 0; i < int16.length; i++) ch[i] = int16[i] / 32768;
+  const src = ctx.createBufferSource();
+  src.buffer = buf;
+  src.connect(ctx.destination);
+  const now = ctx.currentTime;
+  if (nextTime < now + 0.02) nextTime = now + 0.04;
+  src.start(nextTime);
+  nextTime += buf.duration;
+  sources.push(src);
+  updateOrb();
+
+  src.onended = () => {
+    sources = sources.filter(s => s !== src);
+    if (sources.length === 0) {
+      ignoreUntil = performance.now() + ECHO_TAIL_MS;
+      preRoll = [];
+      updateOrb();
+      if (!isSpeaking) {
+        setStatus(isAwake ? 'Awake — listening...' : 'Sleeping — say "Lyla" to start');
+      }
+      if (ws && ws.readyState === 1) {
+        ws.send(JSON.stringify({ type: 'playback_done' }));
+      }
+    }
+  };
+}
+
+function stopAll() {
+  sources.forEach(s => { try { s.stop(); } catch {} });
+  sources = [];
+  nextTime = 0;
+  isGenerating = false;
+  updateOrb();
+}
+
+// ---------- WebSocket ----------
+function connect() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${proto}://${location.host}/ws`);
+  ws.binaryType = 'arraybuffer';
+  ws.onopen = () => setStatus('Connected...');
+  ws.onclose = e => {
+    if (e.code === 4000) return setStatus('Opened on another device. Reload to take over.');
+    setStatus('Disconnected. Reconnecting...'); setTimeout(connect, 1500);
+  };
+  ws.onmessage = onMsg;
+}
+
+function onMsg(ev) {
+  if (typeof ev.data !== 'string') {
+    const turn = new DataView(ev.data).getUint32(0, true);
+    if (turn === currentTurn) playChunk(new Int16Array(ev.data, 4));
+    return;
+  }
+  const m = JSON.parse(ev.data);
+  if (m.type === 'init') {
+    isAwake = m.awake;
+    if (!m.enrolled) {
+      $('enrollModal').style.display = 'flex';
+    } else {
+      setStatus('Sleeping — say "Lyla" to start');
+    }
+    updateOrb();
+  } else if (m.type === 'enroll_result') {
+    isEnrolling = false;
+    $('enrollBtn').classList.remove('rec');
+    $('enrollBtn').textContent = 'Tap to Record (5s)';
+    if (m.ok) {
+      $('enrollModal').style.display = 'none';
+      setStatus('Voice trained! Say "Lyla" to start.');
+    } else {
+      $('enrollStatus').textContent = m.msg;
+    }
+  } else if (m.type === 'state') {
+    isAwake = m.awake;
+    updateOrb();
+    if (!isSpeaking && !isLylaTalking()) {
+      setStatus(isAwake ? 'Awake — listening...' : 'Sleeping — say "Lyla" to start');
+    }
+  } else if (m.type === 'interrupt') {
+    currentTurn = null;
+    stopAll();
+    isSpeaking = true;
+    updateOrb();
+    setStatus('Listening to you...');
+  } else if (m.type === 'turn') {
+    currentTurn = m.id;
+  } else if (m.type === 'ignored') {
+    isGenerating = false;
+    updateOrb();
+    if (!isSpeaking && !isLylaTalking()) {
+      setStatus(isAwake ? 'Awake — listening...' : 'Sleeping — say "Lyla" to start');
+    }
+  } else if (m.turn !== currentTurn) {
+    return;
+  } else if (m.type === 'transcript') {
+    isGenerating = true;
+    updateOrb();
+    addMsg('me', m.text); lyEl = addMsg('ly', ''); setStatus('Lyla is replying...');
+  } else if (m.type === 'reply' && lyEl) {
+    lyEl.textContent += m.text; logEl.scrollTop = logEl.scrollHeight;
+  } else if (m.type === 'timing') {
+    timingEl.textContent = `STT ${m.stt}s | LLM ${m.llm}s | TTS ${m.tts}s | total ${m.total}s`;
+  } else if (m.type === 'done') {
+    isGenerating = false;
+    updateOrb();
+    if (!isSpeaking && !isLylaTalking()) {
+      setStatus(isAwake ? 'Awake — listening...' : 'Sleeping — say "Lyla" to start');
+    }
+  } else if (m.type === 'error') {
+    isGenerating = false;
+    updateOrb();
+    setStatus('Server error: ' + m.text);
+  }
+}
+
+// ---------- Microphone Loop ----------
+function handleAudioChunk(buffer, rms) {
+  if (!ws || ws.readyState !== 1) return;
+
+  if (isEnrolling) {
+    ws.send(buffer);
+    return;
+  }
+
+  if (isMuted) return;
+  if (performance.now() < ignoreUntil && !isSpeaking) return;
+
+  const thresh = isLylaTalking() ? SPEECH_THRESHOLD_BARGE_IN : SPEECH_THRESHOLD;
+
+  if (rms > thresh) {
+    clearTimeout(silenceTimer);
+    silenceTimer = null;
+
+    if (!isSpeaking) {
+      isSpeaking = true;
+      updateOrb();
+      if (!isLylaTalking()) setStatus('Hearing you...');
+      ws.send(JSON.stringify({ type: 'start' }));
+      for (const oldBuf of preRoll) ws.send(oldBuf);
+      preRoll = [];
+    }
+    ws.send(buffer);
+  } else {
+    if (isSpeaking) {
+      ws.send(buffer);
+      if (!silenceTimer) {
+        silenceTimer = setTimeout(() => {
+          isSpeaking = false;
+          silenceTimer = null;
+          updateOrb();
+          if (!isLylaTalking()) setStatus('Processing...');
+          ws.send(JSON.stringify({ type: 'end' }));
+        }, SILENCE_MS);
+      }
+    } else {
+      preRoll.push(buffer);
+      if (preRoll.length > PRE_ROLL_CHUNKS) preRoll.shift();
+    }
+  }
+}
+
+async function startAudio() {
+  ctx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: 'interactive' });
+  await ctx.resume();
+
+  const stream = await navigator.mediaDevices.getUserMedia({ audio: {
+    channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+
+  const url = URL.createObjectURL(new Blob([WORKLET], { type: 'application/javascript' }));
+  await ctx.audioWorklet.addModule(url);
+
+  const source = ctx.createMediaStreamSource(stream);
+  const node = new AudioWorkletNode(ctx, 'cap');
+  node.port.onmessage = e => handleAudioChunk(e.data.buffer, e.data.rms);
+
+  const mute = ctx.createGain();
+  mute.gain.value = 0;
+
+  source.connect(node);
+  node.connect(mute);
+  mute.connect(ctx.destination);
+}
+
+// ---------- Enrollment UI ----------
+$('enrollBtn').onclick = () => {
+  if (isEnrolling) return;
+  isEnrolling = true;
+  stopAll();
+  $('enrollBtn').classList.add('rec');
+  $('enrollBtn').textContent = 'Recording (5s)... Speak now!';
+  $('enrollStatus').textContent = 'Listening to your voice...';
+  ws.send(JSON.stringify({ type: 'enroll_start' }));
+
+  clearTimeout(enrollTimer);
+  enrollTimer = setTimeout(() => {
+    ws.send(JSON.stringify({ type: 'enroll_end' }));
+    $('enrollStatus').textContent = 'Extracting voiceprint...';
+  }, 5000);
+};
+
+$('retrain').onclick = () => {
+  stopAll();
+  $('enrollStatus').textContent = '';
+  $('enrollModal').style.display = 'flex';
+};
+
+orb.onclick = () => {
+  isMuted = !isMuted;
+  if (isMuted && isSpeaking) {
+    isSpeaking = false;
+    clearTimeout(silenceTimer);
+    ws.send(JSON.stringify({ type: 'end' }));
+  }
+  updateOrb();
+  setStatus(isMuted ? 'Microphone muted' : (isAwake ? 'Awake — listening...' : 'Sleeping — say "Lyla"'));
+};
+
+$('start').onclick = async () => {
+  try {
+    await startAudio();
+    connect();
+    $('overlay').remove();
+    await requestWakeLock();
+  } catch (err) { $('err').textContent = 'Could not start: ' + err.message; }
+};
+</script>
+</body>
+</html>

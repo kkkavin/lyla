@@ -12,7 +12,8 @@
                font-family: system-ui, -apple-system, sans-serif; }
   body { display: flex; flex-direction: column;
          padding: env(safe-area-inset-top) 16px env(safe-area-inset-bottom); }
-  #topbar { display: flex; justify-content: flex-end; padding-top: 6px; }
+  #topbar { display: flex; justify-content: space-between; align-items: center; padding-top: 6px; }
+  #sensLabel { font-size: 12px; opacity: .7; }
   #retrain { background: #1d2740; color: #b7c2df; border: 0; border-radius: 999px;
              padding: 6px 12px; font-size: 12px; cursor: pointer; }
   #log { flex: 1; overflow-y: auto; padding: 12px 0; display: flex;
@@ -38,33 +39,36 @@
   .modal { position: fixed; inset: 0; background: #0b0f1a; display: flex; z-index: 10;
            flex-direction: column; align-items: center; justify-content: center; gap: 16px;
            padding: 24px; text-align: center; }
-  .btn { font-size: 17px; padding: 14px 28px; border-radius: 999px; border: 0;
-         background: #4a3fd6; color: #fff; cursor: pointer; }
+  .btn { font-size: 16px; padding: 14px 26px; border-radius: 999px; border: 0;
+         background: #4a3fd6; color: #fff; cursor: pointer; width: 100%; max-width: 320px; }
   .btn.rec { background: #d63f8c; }
   .prompt-box { background: #161d2e; padding: 16px 20px; border-radius: 14px; max-width: 360px;
-                line-height: 1.5; font-size: 15px; color: #cfd8f0; }
+                line-height: 1.5; font-size: 14.5px; color: #cfd8f0; text-align: left; }
 </style>
 </head>
 <body>
+<audio id="lylaAudio" autoplay playsinline></audio>
+
 <div id="overlay" class="modal">
   <h2>Lyla</h2>
-  <button id="start" class="btn">Tap to start always-on mode</button>
+  <button id="start" class="btn">Tap to start Live Voice Mode</button>
   <div id="err" style="opacity:.7;font-size:14px"></div>
 </div>
 
 <div id="enrollModal" class="modal" style="display:none">
-  <h2>Train Lyla on Your Voice</h2>
-  <div style="opacity:.8;font-size:14px;max-width:340px">
-    So Lyla only responds to <b>you</b> and never interrupts herself on speaker, tap below and read this out loud:
+  <h2>Train Lyla on Your Room Voice</h2>
+  <div style="opacity:.8;font-size:14px;max-width:350px">
+    Place your phone across the room (2 arm lengths away), tap below, and speak in your <b>normal room voice</b> for 5 seconds:
   </div>
   <div class="prompt-box">
-    "Hey Lyla, this is my voice. Whenever I speak to you on speaker mode, listen only to me and ignore your own echo."
+    "Hey Lyla, this is my normal voice speaking from across the room. Listen to me clearly and ignore background noise."
   </div>
   <button id="enrollBtn" class="btn">Tap to Record (5s)</button>
-  <div id="enrollStatus" style="opacity:.75;font-size:14px"></div>
+  <div id="enrollStatus" style="opacity:.85;font-size:14px;min-height:20px"></div>
 </div>
 
 <div id="topbar">
+  <span id="sensLabel">WebRTC AEC3 + Neural VAD Live</span>
   <button id="retrain">Re-train Voice</button>
 </div>
 <div id="log"></div>
@@ -88,17 +92,14 @@ class Cap extends AudioWorkletProcessor {
       p += r;
     }
     this.pos = p - n; this.last = x[n - 1];
-    if (this.acc.length >= 480) {
-      const pcm = new Int16Array(this.acc.length);
-      let sumSq = 0;
-      for (let k = 0; k < pcm.length; k++) {
+    while (this.acc.length >= 512) {          // Exact 32ms frame (512 samples at 16kHz)
+      const pcm = new Int16Array(512);
+      for (let k = 0; k < 512; k++) {
         const s = Math.max(-1, Math.min(1, this.acc[k]));
-        sumSq += s * s;
         pcm[k] = s < 0 ? s * 32768 : s * 32767;
       }
-      const rms = Math.sqrt(sumSq / pcm.length);
-      this.acc = [];
-      this.port.postMessage({ buffer: pcm.buffer, rms }, [pcm.buffer]);
+      this.acc.splice(0, 512);
+      this.port.postMessage(pcm.buffer, [pcm.buffer]);
     }
     return true;
   }
@@ -108,16 +109,9 @@ registerProcessor('cap', Cap);`;
 const $ = id => document.getElementById(id);
 const logEl = $('log'), statusEl = $('status'), timingEl = $('timing'), orb = $('orb');
 
-const SPEECH_THRESHOLD = 0.016;
-const SPEECH_THRESHOLD_BARGE_IN = 0.011;
-const SILENCE_MS = 900;
-const PRE_ROLL_CHUNKS = 10;
-const ECHO_TAIL_MS = 300;
-
-let ws, ctx, currentTurn = null, nextTime = 0, sources = [], lyEl = null;
+let ws, ctx, outputNode, currentTurn = null, nextTime = 0, sources = [], lyEl = null;
 let isAwake = false, isMuted = false, isSpeaking = false, isGenerating = false;
 let isEnrolling = false, enrollTimer = null;
-let silenceTimer = null, preRoll = [], ignoreUntil = 0;
 
 const setStatus = t => statusEl.textContent = t;
 const isLylaTalking = () => sources.length > 0 || isGenerating;
@@ -131,6 +125,7 @@ async function requestWakeLock() {
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible') {
     if (ctx && ctx.state === 'suspended') ctx.resume().catch(() => {});
+    $('lylaAudio').play().catch(() => {});
     requestWakeLock();
   }
 });
@@ -159,14 +154,48 @@ function addMsg(cls, text) {
   logEl.appendChild(d); logEl.scrollTop = logEl.scrollHeight; return d;
 }
 
-// ---------- Playback ----------
+// ---------- WebRTC AEC3 Loopback Audio Output ----------
+async function setupWebRtcAecPlayback(audioCtx) {
+  try {
+    const dest = audioCtx.createMediaStreamDestination();
+    const pc1 = new RTCPeerConnection();
+    const pc2 = new RTCPeerConnection();
+
+    pc1.onicecandidate = e => { if (e.candidate) pc2.addIceCandidate(e.candidate).catch(() => {}); };
+    pc2.onicecandidate = e => { if (e.candidate) pc1.addIceCandidate(e.candidate).catch(() => {}); };
+
+    pc2.ontrack = e => {
+      const el = $('lylaAudio');
+      el.srcObject = e.streams[0];
+      el.play().catch(() => {});
+    };
+
+    dest.stream.getTracks().forEach(t => pc1.addTrack(t, dest.stream));
+    const offer = await pc1.createOffer();
+    await pc1.setLocalDescription(offer);
+    await pc2.setRemoteDescription(offer);
+    const answer = await pc2.createAnswer();
+    await pc2.setLocalDescription(answer);
+    await pc1.setRemoteDescription(answer);
+
+    const gain = audioCtx.createGain();
+    gain.gain.value = 1.4;
+    gain.connect(dest);
+    return gain;
+  } catch (err) {
+    console.warn('WebRTC AEC3 loopback fallback:', err);
+    return audioCtx.destination;
+  }
+}
+
 function playChunk(int16) {
   const buf = ctx.createBuffer(1, int16.length, 24000);
   const ch = buf.getChannelData(0);
   for (let i = 0; i < int16.length; i++) ch[i] = int16[i] / 32768;
   const src = ctx.createBufferSource();
   src.buffer = buf;
-  src.connect(ctx.destination);
+  src.connect(outputNode);
+
   const now = ctx.currentTime;
   if (nextTime < now + 0.02) nextTime = now + 0.04;
   src.start(nextTime);
@@ -177,8 +206,6 @@ function playChunk(int16) {
   src.onended = () => {
     sources = sources.filter(s => s !== src);
     if (sources.length === 0) {
-      ignoreUntil = performance.now() + ECHO_TAIL_MS;
-      preRoll = [];
       updateOrb();
       if (!isSpeaking) {
         setStatus(isAwake ? 'Awake — listening...' : 'Sleeping — say "Lyla" to start');
@@ -232,7 +259,7 @@ function onMsg(ev) {
     $('enrollBtn').textContent = 'Tap to Record (5s)';
     if (m.ok) {
       $('enrollModal').style.display = 'none';
-      setStatus('Voice trained! Say "Lyla" to start.');
+      setStatus('Room voice trained! Say "Lyla" to start.');
     } else {
       $('enrollStatus').textContent = m.msg;
     }
@@ -241,6 +268,12 @@ function onMsg(ev) {
     updateOrb();
     if (!isSpeaking && !isLylaTalking()) {
       setStatus(isAwake ? 'Awake — listening...' : 'Sleeping — say "Lyla" to start');
+    }
+  } else if (m.type === 'vad') {
+    isSpeaking = m.speaking;
+    updateOrb();
+    if (!isLylaTalking()) {
+      setStatus(isSpeaking ? 'Hearing you...' : 'Processing...');
     }
   } else if (m.type === 'interrupt') {
     currentTurn = null;
@@ -252,14 +285,16 @@ function onMsg(ev) {
     currentTurn = m.id;
   } else if (m.type === 'ignored') {
     isGenerating = false;
+    isSpeaking = false;
     updateOrb();
-    if (!isSpeaking && !isLylaTalking()) {
+    if (!isLylaTalking()) {
       setStatus(isAwake ? 'Awake — listening...' : 'Sleeping — say "Lyla" to start');
     }
   } else if (m.turn !== currentTurn) {
     return;
   } else if (m.type === 'transcript') {
     isGenerating = true;
+    isSpeaking = false;
     updateOrb();
     addMsg('me', m.text); lyEl = addMsg('ly', ''); setStatus('Lyla is replying...');
   } else if (m.type === 'reply' && lyEl) {
@@ -279,65 +314,31 @@ function onMsg(ev) {
   }
 }
 
-// ---------- Microphone Loop ----------
-function handleAudioChunk(buffer, rms) {
-  if (!ws || ws.readyState !== 1) return;
-
-  if (isEnrolling) {
-    ws.send(buffer);
-    return;
-  }
-
-  if (isMuted) return;
-  if (performance.now() < ignoreUntil && !isSpeaking) return;
-
-  const thresh = isLylaTalking() ? SPEECH_THRESHOLD_BARGE_IN : SPEECH_THRESHOLD;
-
-  if (rms > thresh) {
-    clearTimeout(silenceTimer);
-    silenceTimer = null;
-
-    if (!isSpeaking) {
-      isSpeaking = true;
-      updateOrb();
-      if (!isLylaTalking()) setStatus('Hearing you...');
-      ws.send(JSON.stringify({ type: 'start' }));
-      for (const oldBuf of preRoll) ws.send(oldBuf);
-      preRoll = [];
-    }
-    ws.send(buffer);
-  } else {
-    if (isSpeaking) {
-      ws.send(buffer);
-      if (!silenceTimer) {
-        silenceTimer = setTimeout(() => {
-          isSpeaking = false;
-          silenceTimer = null;
-          updateOrb();
-          if (!isLylaTalking()) setStatus('Processing...');
-          ws.send(JSON.stringify({ type: 'end' }));
-        }, SILENCE_MS);
-      }
-    } else {
-      preRoll.push(buffer);
-      if (preRoll.length > PRE_ROLL_CHUNKS) preRoll.shift();
-    }
-  }
-}
-
+// ---------- Continuous Full-Duplex Mic Capture ----------
 async function startAudio() {
   ctx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: 'interactive' });
   await ctx.resume();
 
+  // Initialize WebRTC AEC3 playback path FIRST so Chrome registers it as the far-end echo reference
+  outputNode = await setupWebRtcAecPlayback(ctx);
+
   const stream = await navigator.mediaDevices.getUserMedia({ audio: {
-    channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+    channelCount: 1,
+    echoCancellation: true,
+    noiseSuppression: true,
+    autoGainControl: true
+  }});
 
   const url = URL.createObjectURL(new Blob([WORKLET], { type: 'application/javascript' }));
   await ctx.audioWorklet.addModule(url);
 
   const source = ctx.createMediaStreamSource(stream);
   const node = new AudioWorkletNode(ctx, 'cap');
-  node.port.onmessage = e => handleAudioChunk(e.data.buffer, e.data.rms);
+  node.port.onmessage = e => {
+    if (!isMuted && ws && ws.readyState === 1) {
+      ws.send(e.data);
+    }
+  };
 
   const mute = ctx.createGain();
   mute.gain.value = 0;
@@ -353,14 +354,14 @@ $('enrollBtn').onclick = () => {
   isEnrolling = true;
   stopAll();
   $('enrollBtn').classList.add('rec');
-  $('enrollBtn').textContent = 'Recording (5s)... Speak now!';
-  $('enrollStatus').textContent = 'Listening to your voice...';
+  $('enrollBtn').textContent = 'Recording (5s)... Speak from across the room!';
+  $('enrollStatus').textContent = 'Listening...';
   ws.send(JSON.stringify({ type: 'enroll_start' }));
 
   clearTimeout(enrollTimer);
   enrollTimer = setTimeout(() => {
     ws.send(JSON.stringify({ type: 'enroll_end' }));
-    $('enrollStatus').textContent = 'Extracting voiceprint...';
+    $('enrollStatus').textContent = 'Saving room voiceprint...';
   }, 5000);
 };
 
@@ -372,11 +373,6 @@ $('retrain').onclick = () => {
 
 orb.onclick = () => {
   isMuted = !isMuted;
-  if (isMuted && isSpeaking) {
-    isSpeaking = false;
-    clearTimeout(silenceTimer);
-    ws.send(JSON.stringify({ type: 'end' }));
-  }
   updateOrb();
   setStatus(isMuted ? 'Microphone muted' : (isAwake ? 'Awake — listening...' : 'Sleeping — say "Lyla"'));
 };
